@@ -1,7 +1,7 @@
 source:  https://github.com/ZagrosGM/Zagros
-ref:     7e0bc10
-commit:  7e0bc10803bf236236b8f1a09305c94b1a49281f
-synced:  2026-08-28T23:29:24Z
+ref:     6e52da1
+commit:  6e52da11c563682c8e68439a0357e0a231e6caa7
+synced:  2026-08-29T11:15:36Z
 
 vendored paths:
   app/cores/**        — core drivers, CoreManager, registry, types

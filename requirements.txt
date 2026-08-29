@@ -9,3 +9,5 @@ pydantic>=2.9,<3
 psutil>=5.9
 cryptography>=43
 pyOpenSSL>=24
+grpcio>=1.60                 # sing-box per-user counters (StatsService gRPC)
+protobuf>=4.25               # xray_api's generated stubs import google.protobuf

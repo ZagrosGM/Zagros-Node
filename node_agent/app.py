@@ -34,8 +34,10 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from app.cores.manager import CoreManager
-from app.cores.types import CoreState, UserAccount
+from app.cores.types import Capability, CoreState, UserAccount
 from app.cores.registry import available_drivers, discover_builtin, get_driver_class
+from node_agent.accounts_store import AccountsStore
+from node_agent.limits import NodeBandwidthLimiter
 from node_agent import tls
 from node_agent.config import (
     AGENT_NAME,
@@ -108,6 +110,11 @@ core_manager = CoreManager(
     NodeCoreStateStore(CFG.data_dir), builtin_core_ids=frozenset(),
     settings_transform=_node_driver_settings)
 
+# Host-level traffic shaping. The panel owns the rates, this host owns the
+# wire — see node_agent/limits.py.
+limiter = NodeBandwidthLimiter(core_manager, CFG.data_dir)
+accounts_store = AccountsStore(CFG.data_dir)
+
 _SECRET_MARKERS = ("secret", "password", "passwd", "token", "key", "psk", "pass")
 
 
@@ -158,6 +165,10 @@ def _authorize_core(core_id: str, settings: dict[str, Any] | None = None) -> Non
 async def lifespan(_app: FastAPI):
     await core_manager.boot()
     await core_manager.start_enabled()
+    restore_usage_baselines()
+    await restore_accounts()
+    limiter.load()
+    limiter.apply()   # limits pushed earlier must survive a restart
     stop_info = await start_info_server(CFG, identity, core_manager, CERTIFICATE,
                                         started_at=STARTED_AT)
     try:
@@ -482,11 +493,212 @@ async def core_accounts(core_id: str, body: AccountsPayload,
         identity.audit("accounts.failed", {"core_id": core_id,
                                            "error_type": type(exc).__name__})
         raise HTTPException(409, str(exc)) from exc
+    accounts_store.store(core_id, [raw for raw in body.accounts
+                                   if isinstance(raw, dict)],
+                         replace=bool(body.replace))
     identity.audit("accounts.sync", {"core_id": core_id,
                                      "count": len(accounts),
                                      "replace": body.replace})
     return {"ok": True, "core_id": core_id, "count": len(accounts),
             "replace": body.replace}
+
+
+class BandwidthLimitsBody(BaseModel):
+    """The panel's per-user speed limits for this host."""
+
+    limits: dict[str, Any] = Field(default_factory=dict)
+
+
+@app.put("/v1/bandwidth/limits")
+async def bandwidth_limits(body: BandwidthLimitsBody,
+                           _node=Depends(signed_request)):
+    """Enforce the panel's per-user speed limits on THIS host.
+
+    Shaping cannot be done from the panel: tc filters and nft marks only
+    affect the machine carrying the packets. The panel computes the rates (it
+    owns the users), the node installs them (it owns the wire).
+    """
+    result = await asyncio.to_thread(limiter.apply, body.limits)
+    identity.audit("bandwidth.apply", {
+        "limited_users": result.get("limited_users"),
+        "ok": result.get("ok"),
+    })
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("error") or "bandwidth apply failed")
+    return {"ok": True, **result}
+
+
+@app.get("/v1/bandwidth/status")
+async def bandwidth_status(_node=Depends(signed_request)):
+    return await asyncio.to_thread(limiter.status)
+
+
+# --------------------------------------------------------------------------- #
+# runtime telemetry — what the panel cannot see from here
+# --------------------------------------------------------------------------- #
+# The panel drives quota, presence and limits from its OWN cores only, so a
+# user connected through this node looked offline, consumed nothing and was
+# never shaped. These endpoints hand the panel the same three readings its
+# local drivers give it; the panel folds them into the very same pipelines
+# (UsageRecord/DeviceSession already carry a node_id for exactly this).
+
+_TELEMETRY_TIMEOUT = 30.0
+
+
+def _capable_drivers(capability) -> list[tuple[str, Any]]:
+    """(core_id, driver) for every installed, enabled core with `capability`."""
+    out: list[tuple[str, Any]] = []
+    for core_id in core_manager.list_cores():
+        try:
+            if not core_manager.is_enabled(core_id):
+                continue
+            driver = core_manager.get(core_id)
+        except Exception:  # noqa: BLE001 — a half-loaded core contributes none
+            continue
+        if capability in driver.metadata.capabilities:
+            out.append((core_id, driver))
+    return out
+
+
+@app.get("/v1/runtime/devices")
+async def runtime_devices(_node=Depends(signed_request)):
+    """Every online session this node is serving, across all cores.
+
+    Presence is derived from the drivers themselves (wg handshakes, openvpn
+    status, accel-ppp sessions, ...), exactly as the panel does locally.
+    """
+    sessions: list[dict] = []
+    failed: list[str] = []
+    for core_id, driver in _capable_drivers(Capability.ONLINE_TRACKING):
+        try:
+            found = await asyncio.wait_for(
+                driver.get_online_devices(account_ids=None),
+                timeout=_TELEMETRY_TIMEOUT)
+        except asyncio.TimeoutError:
+            failed.append(core_id)
+            continue
+        except Exception as exc:  # noqa: BLE001 — one bad core never blocks
+            logger.warning("online devices read failed for %s: %s", core_id, exc)
+            failed.append(core_id)
+            continue
+        for session in found or []:
+            payload = session.model_dump(mode="json")
+            payload.setdefault("core_id", core_id)
+            sessions.append(payload)
+    return {"devices": sessions, "failed_cores": failed}
+
+
+@app.get("/v1/runtime/usage")
+async def runtime_usage(_node=Depends(signed_request)):
+    """Per-account usage DELTAS since the previous call.
+
+    Counters are cumulative on the providers; the drivers' trackers turn them
+    into deltas, and the baselines are persisted here so an agent restart
+    cannot re-emit a whole counter as fresh traffic (the classic multi-node
+    double-count).
+    """
+    records: list[dict] = []
+    baselines: dict[str, Any] = {}
+    for core_id, driver in _capable_drivers(Capability.USAGE_ACCOUNTING):
+        try:
+            found = await asyncio.wait_for(
+                driver.get_usage(account_ids=None), timeout=_TELEMETRY_TIMEOUT)
+        except asyncio.TimeoutError:
+            continue
+        except Exception as exc:  # noqa: BLE001 — isolate a broken tick
+            logger.warning("usage read failed for %s: %s", core_id, exc)
+            continue
+        for record in found or []:
+            if not (record.uplink_bytes or record.downlink_bytes):
+                continue
+            payload = record.model_dump(mode="json")
+            payload.setdefault("core_id", core_id)
+            records.append(payload)
+        # Persist the cursor ONLY after the deltas were handed over: losing a
+        # delta is honest, moving the cursor before delivery loses bytes.
+        try:
+            snapshot = driver.usage_tracker_snapshot(None) or {}
+        except Exception:  # noqa: BLE001
+            snapshot = {}
+        for account_id, totals in snapshot.items():
+            baselines[f"{core_id}:{account_id}"] = [int(totals[0]), int(totals[1])]
+    if baselines:
+        _save_usage_baselines(baselines)
+    return {"usage": records}
+
+
+def _usage_baseline_path() -> Path:
+    return Path(CFG.data_dir) / "usage-baselines.json"
+
+
+def _save_usage_baselines(baselines: dict[str, Any]) -> None:
+    try:
+        path = _usage_baseline_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        merged: dict[str, Any] = {}
+        if path.exists():
+            try:
+                merged = json.loads(path.read_text(encoding="utf-8")) or {}
+            except (OSError, ValueError):
+                merged = {}
+        merged.update(baselines)
+        path.write_text(json.dumps(merged, sort_keys=True), encoding="utf-8")
+    except OSError as exc:  # never fail a telemetry read over bookkeeping
+        logger.warning("usage baseline persist failed: %s", exc)
+
+
+def restore_usage_baselines() -> None:
+    """Boot-time restore: a restarted agent must not re-report old bytes."""
+    path = _usage_baseline_path()
+    if not path.exists():
+        return
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return
+    by_core: dict[str, dict[str, tuple[int, int]]] = {}
+    for key, totals in stored.items():
+        core_id, _, account_id = str(key).partition(":")
+        if not core_id or not isinstance(totals, (list, tuple)) or len(totals) != 2:
+            continue
+        by_core.setdefault(core_id, {})[account_id] = (int(totals[0]), int(totals[1]))
+    for core_id, mapping in by_core.items():
+        if core_id not in core_manager.list_cores():
+            continue
+        try:
+            core_manager.get(core_id).restore_usage_baselines(mapping)
+        except Exception:  # noqa: BLE001
+            logger.warning("usage baseline restore failed for %s", core_id)
+
+
+async def restore_accounts() -> None:
+    """Boot-time replay of the accounts the panel last pushed.
+
+    The drivers hold accounts in memory only, so a restart used to leave a
+    node serving traffic normally while silently losing everything that reads
+    the account list — bandwidth identities above all, which is how a pushed
+    speed limit turned into a no-op until the next full sync. Replaying the
+    snapshot restores the same state without waiting for the panel.
+    """
+    for core_id, raws in accounts_store.all().items():
+        if not raws or core_id not in core_manager.list_cores():
+            continue
+        accounts = []
+        for raw in raws:
+            try:
+                accounts.append(_to_user_account(raw))
+            except HTTPException as exc:
+                logger.warning("stored account for %s is stale: %s",
+                               core_id, exc.detail)
+        if not accounts:
+            continue
+        try:
+            await asyncio.wait_for(core_manager.get(core_id).sync_accounts(
+                accounts), timeout=_ACCOUNTS_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 — never block the boot
+            logger.warning("account restore failed for %s: %s", core_id, exc)
+        else:
+            logger.info("restored %d account(s) for %s", len(accounts), core_id)
 
 
 @app.post("/v1/cores/{core_id}/lifecycle")
@@ -508,6 +720,8 @@ async def core_lifecycle(core_id: str, body: CoreActionBody, wait: float = 0,
         elif action == "uninstall":
             await core_manager.uninstall_core(
                 core_id, purge=body.purge, force=body.force)
+            if body.purge:
+                accounts_store.forget(core_id)
             return {"core_id": core_id, "state": "uninstalled"}
         elif action == "start":
             await core_manager.start_core(core_id)

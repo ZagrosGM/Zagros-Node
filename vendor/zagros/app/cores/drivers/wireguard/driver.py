@@ -1040,7 +1040,7 @@ class WireGuardDriver(BaseCoreDriver):
     def export_identity(self) -> dict[str, str]:
         out: dict[str, str] = {}
         for index, listener in enumerate(self._listeners()):
-            backend = self._backends.get(listener["interface"])
+            backend = self._backends.get(listener["tag"])
             reader = getattr(backend, "read_server_private_key", None)
             if not callable(reader):
                 continue
@@ -1060,7 +1060,7 @@ class WireGuardDriver(BaseCoreDriver):
             content = (material.get(name) or "").strip()
             if not content:
                 continue
-            backend = self._backends.get(listener["interface"])
+            backend = self._backends.get(listener["tag"])
             # Validate before touching the file: a malformed key would take
             # the interface down with no way back.
             validator = getattr(backend, "public_from_private", None)

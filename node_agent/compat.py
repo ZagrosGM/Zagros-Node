@@ -19,6 +19,7 @@ Two classes of shim:
 """
 from __future__ import annotations
 
+import importlib.util
 import sys
 import types
 from typing import Any
@@ -60,6 +61,20 @@ def _fail(name: str) -> Any:
         raise PanelOnlyFeatureError(
             f"'{name}' is panel-only and is not available on a Zagros node")
     return _raise
+
+
+def _shipped_by_panel(name: str) -> bool:
+    """True when the real module ships in the vendored panel tree.
+
+    ``node_agent`` vendors a *subset* of the panel (``app.cores`` and friends).
+    Whenever a module the drivers import is part of that subset, the real
+    implementation must win: the stand-ins below are only for the modules the
+    node genuinely does not have (database, subscription rendering, ...).
+    """
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
 
 
 def _module(name: str, **attrs: Any) -> types.ModuleType:
@@ -108,6 +123,12 @@ def install() -> None:
         ("app.xray", _module("app.xray")),
         ("app.xray.config", xray_config),
     ):
+        if _shipped_by_panel(name):
+            # The vendored panel tree carries the real module: never shadow it
+            # with a stand-in. Registering the shim first would make every
+            # later ``import app.platform.bandwidth`` resolve to the stub and
+            # fail with "cannot import name ... (unknown location)".
+            continue
         sys.modules.setdefault(name, module)
 
     setattr(sys, INSTALLED_FLAG, True)

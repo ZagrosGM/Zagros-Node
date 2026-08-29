@@ -27,6 +27,23 @@ mkdir -p "$DEST/app"
 cp -a "$SRC/app/cores" "$DEST/app/cores"
 cp -a "$SRC/app/crypto" "$DEST/app/crypto"
 
+# --- the v2ray/xray gRPC stats client --------------------------------------
+# sing-box has no per-user API of its own: the driver reads user counters over
+# the StatsService gRPC dialect, exactly like xray does. Without this package
+# a node silently stops accounting sing-box traffic (and never reports those
+# users online), so it must ship inside the agent.
+cp -a "$SRC/xray_api" "$DEST/xray_api"
+
+# --- host bandwidth shaping (stdlib-only, safe to vendor) ------------------
+# Shaping is a host-level act: tc/nft only affect the machine carrying the
+# packets, so every node must run the limiter itself. The module imports
+# nothing but the standard library; the panel injects the desired rates.
+mkdir -p "$DEST/app/platform"
+cp -a "$SRC/app/platform/bandwidth.py" "$DEST/app/platform/bandwidth.py"
+cat > "$DEST/app/platform/__init__.py" <<'PY'
+"""Vendored subset of app.platform (only the bandwidth limiter)."""
+PY
+
 # --- the tiny helpers the drivers import ----------------------------------
 mkdir -p "$DEST/app/studio" "$DEST/app/utils" "$DEST/app/persistence"
 cp -a "$SRC/app/studio/headers.py" "$DEST/app/studio/headers.py"
