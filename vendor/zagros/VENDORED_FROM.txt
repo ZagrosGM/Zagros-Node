@@ -1,0 +1,11 @@
+source:  https://github.com/ZagrosGM/Zagros
+ref:     7e0bc10
+commit:  7e0bc10803bf236236b8f1a09305c94b1a49281f
+synced:  2026-08-28T23:29:24Z
+
+vendored paths:
+  app/cores/**        — core drivers, CoreManager, registry, types
+  app/crypto/**       — AES-GCM + X25519 primitives
+  app/studio/{headers,certs}.py
+  app/utils/crypto.py
+  app/persistence/cipher.py

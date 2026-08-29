@@ -1,0 +1,27 @@
+# Zagros Node — rendered by install.sh (kept here as the canonical template).
+#
+# network_mode: host is required, not a preference: the node binds the
+# inbound ports its cores serve (443, 1194, 51820, 1723, ...), and those
+# ports are only knowable at runtime. Port-mapping dozens of dynamic
+# listeners through a bridge would be both fragile and lossy.
+services:
+  zagros-node:
+    image: ${ZAGROS_NODE_IMAGE:-ghcr.io/zagrosgm/zagros-node:latest}
+    container_name: zagros-node
+    restart: always
+    network_mode: host
+    # TUN cores (OpenVPN, WireGuard) create interfaces: without NET_ADMIN and
+    # the tunnel device their start dies at interface creation. NET_RAW is
+    # required by the PPTP engine (GRE protocol 47), SYS_ADMIN by per-outbound
+    # network namespaces. The node never receives the Docker socket.
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+      - /dev/ppp:/dev/ppp
+    volumes:
+      - /var/lib/zagros:/var/lib/zagros
+    env_file:
+      - .env

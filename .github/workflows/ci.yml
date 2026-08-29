@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install requests
+
+      - name: Syntax + import check
+        run: |
+          python -m compileall -q node_agent
+          PYTHONPATH=vendor/zagros python -c "import node_agent.cli; print('agent imports cleanly')"
+
+      - name: End-to-end agent flow (pairing, signing, replay, job)
+        run: PYTHONPATH=vendor/zagros python tests/test_agent_flow.py --no-core
+
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: The vendored runtime must import without the panel
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          PYTHONPATH=vendor/zagros python -c "
+          from app.cores.registry import discover_builtin, available_drivers
+          discover_builtin()
+          drivers = sorted(available_drivers())
+          expected = {'xray', 'sing-box', 'openvpn', 'wireguard', 'ssh', 'softether', 'pptp'}
+          missing = expected - set(drivers)
+          assert not missing, f'missing drivers: {missing}'
+          print('vendored drivers:', drivers)
+          "

@@ -1,0 +1,11 @@
+# Zagros Node — runtime dependencies.
+#
+# Deliberately small: the core drivers are vendored (vendor/zagros) and
+# install their own binaries at runtime, so nothing core-specific is
+# installed here.
+fastapi>=0.115,<1
+uvicorn[standard]>=0.30
+pydantic>=2.9,<3
+psutil>=5.9
+cryptography>=43
+pyOpenSSL>=24
