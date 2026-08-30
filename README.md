@@ -13,7 +13,7 @@ and capability model rebuilt:
 | pairing | panel-issued certificate | certificate pinning (SHA-256) + one-time registration token |
 | long operations | inline request | **jobs** (`POST …/lifecycle` → poll `GET /v1/jobs/{id}`) |
 | per-node core management | — | full catalog → install → start/stop/restart → logs → uninstall |
-| CLI | — | `zagros-node up\|down\|update\|uninstall\|status\|logs\|cert\|info\|cores` |
+| CLI | — | `zagros-node up\|down\|status\|logs\|update\|cores\|env\|info` (+ `advanced …`) |
 
 The panel drives every core on a node through the **same driver runtime the panel itself uses**
 (`vendor/zagros`), so a core behaves identically on the master and on a node.
@@ -74,13 +74,15 @@ The panel drives every core on a node through the **same driver runtime the pane
 The panel generates this command for you (**Nodes → add node → Generate installer command**):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-node/main/scripts/install.sh \
+curl -fsSL https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/install-node.sh \
   | bash -s -- --panel-id panel-9f2c... --token <ONE-TIME-TOKEN> \
              --name de-1 --address 203.0.113.10 --port 62050 --api-port 62051
 ```
 
-The installer installs Docker (if missing), writes `/opt/zagros-node/.env`, installs the
-`zagros-node` CLI, pulls `ghcr.io/zagrosgm/zagros-node:latest`, starts the container and prints the
+The installer lives in the **zagros-scripts** repository, next to the panel's own
+installer — one place to fetch anything Zagros. It installs Docker (if missing), writes
+`/opt/zagros-node/.env`, installs the `zagros-node` CLI (also from zagros-scripts), pulls
+`ghcr.io/zagrosgm/zagros-node:latest`, starts the container and prints the
 pairing material:
 
 ```
@@ -104,7 +106,9 @@ Host requirements: Linux, **amd64**, root, Docker, and — for the TUN cores —
 
 ```bash
 git clone https://github.com/ZagrosGM/zagros-node.git && cd zagros-node
-./scripts/install.sh --local-build "$(pwd)" --token <TOKEN> --name de-1 --address 203.0.113.10
+ZAGROS_SCRIPTS_REF=main bash -c "$(curl -fsSL \
+  https://raw.githubusercontent.com/ZagrosGM/zagros-scripts/main/install-node.sh)" \
+  -- --local-build "$(pwd)" --token <TOKEN> --name de-1 --address 203.0.113.10
 # or just:
 docker build -t zagros-node:local .
 ```
