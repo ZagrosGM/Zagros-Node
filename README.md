@@ -146,14 +146,15 @@ node_agent/          the agent itself
   cli.py             in-container CLI (used by the host CLI)
 vendor/zagros/       pinned copy of the panel's core runtime (drivers + CoreManager)
 scripts/             entrypoint.sh, install.sh, zagros-node host CLI
-tools/sync-vendor.sh refresh vendor/zagros from a Zagros tag
-tests/               end-to-end agent flow (no Docker needed)
 ```
+
+Development material — the agent-flow test suite and `sync-vendor.sh` — lives in
+the [zagros-devkit](https://github.com/ZagrosGM/zagros-devkit) repository.
 
 ### Why vendored cores instead of importing the panel?
 
 A node must be **standalone** — no panel code, no panel database, no panel web stack — but the core
-drivers are owned by the panel. `tools/sync-vendor.sh` therefore copies a pinned snapshot of the
+drivers are owned by the panel. `sync-vendor.sh` (in zagros-devkit) therefore copies a pinned snapshot of the
 driver runtime (79 files) plus its four tiny helpers, and the agent installs audited stand-ins for
 the handful of panel modules the drivers touch (`node_agent/compat.py`). Two consequences:
 
@@ -162,17 +163,21 @@ the handful of panel modules the drivers touch (`node_agent/compat.py`). Two con
 * the vendored tree is verified in CI to import **without** the panel and to expose all seven drivers.
 
 ```bash
-./tools/sync-vendor.sh /path/to/Zagros v1.0.0-alpha.8.9
+git clone https://github.com/ZagrosGM/zagros-devkit.git
+bash zagros-devkit/zagros-node/tools/sync-vendor.sh /path/to/Zagros
 ```
 
 ---
 
 ## Tests
 
+The suite lives in [zagros-devkit](https://github.com/ZagrosGM/zagros-devkit).
+
 ```bash
+git clone https://github.com/ZagrosGM/zagros-devkit.git
 pip install -r requirements.txt requests
-PYTHONPATH=vendor/zagros python tests/test_agent_flow.py            # includes a real core install
-PYTHONPATH=vendor/zagros python tests/test_agent_flow.py --no-core  # offline
+PYTHONPATH=vendor/zagros python zagros-devkit/zagros-node/tests/test_agent_flow.py            # real core install
+PYTHONPATH=vendor/zagros python zagros-devkit/zagros-node/tests/test_agent_flow.py --no-core  # offline
 ```
 
 The suite boots the agent on ephemeral ports and walks the whole path the panel takes: info port →

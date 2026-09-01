@@ -26,7 +26,18 @@ jobs:
           PYTHONPATH=vendor/zagros python -c "import node_agent.cli; print('agent imports cleanly')"
 
       - name: End-to-end agent flow (pairing, signing, replay, job)
-        run: PYTHONPATH=vendor/zagros python tests/test_agent_flow.py --no-core
+        env:
+          DEVKIT_TOKEN: ${{ secrets.DEVKIT_TOKEN }}
+        run: |
+          if [ -z "$DEVKIT_TOKEN" ]; then
+            echo "DEVKIT_TOKEN is not set — the agent-flow test lives in the"
+            echo "private zagros-devkit repository, so this check is skipped."
+            exit 0
+          fi
+          git clone --depth 1 \
+            "https://x-access-token:${DEVKIT_TOKEN}@github.com/ZagrosGM/zagros-devkit.git" \
+            /tmp/devkit
+          PYTHONPATH=vendor/zagros python /tmp/devkit/zagros-node/tests/test_agent_flow.py --no-core
 
   vendor:
     runs-on: ubuntu-latest
