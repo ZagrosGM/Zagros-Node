@@ -503,6 +503,27 @@ async def core_accounts(core_id: str, body: AccountsPayload,
             "replace": body.replace}
 
 
+class IPBansBody(BaseModel):
+    """Panel-owned active bans, projected onto this node's VPN listeners."""
+    bans: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@app.put("/v1/ip-bans")
+async def apply_ip_bans(body: IPBansBody, _node=Depends(signed_request)):
+    from node_agent import ip_limits
+
+    tcp, udp = await ip_limits.managed_ports(core_manager)
+    result = await asyncio.to_thread(ip_limits.apply, body.bans, tcp, udp)
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("error") or "IP ban apply failed")
+    ips = {str(row.get("ip")) for row in body.bans if row.get("ip")}
+    closed = await ip_limits.terminate(core_manager, ips)
+    closed += await asyncio.to_thread(ip_limits.drop_conntrack, ips, tcp, udp)
+    identity.audit("ip_bans.apply", {"active": result.get("active", 0),
+                                     "connections_closed": closed})
+    return {**result, "connections_closed": closed}
+
+
 class BandwidthLimitsBody(BaseModel):
     """The panel's per-user speed limits for this host."""
 

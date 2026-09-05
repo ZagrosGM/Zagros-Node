@@ -91,7 +91,7 @@ RUN set -eux; \
     test "$(dpkg --print-architecture)" = "amd64"; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-       ca-certificates curl iptables nftables iproute2 procps busybox-static \
+       ca-certificates curl iptables nftables iproute2 conntrack procps busybox-static \
        openvpn wireguard-tools openssh-client openssh-server ppp \
        libpcre2-8-0 libssl3 kmod; \
     mkdir -p /usr/share/doc/zagros-node; \

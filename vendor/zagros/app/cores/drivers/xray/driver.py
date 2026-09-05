@@ -40,6 +40,7 @@ from app.cores.types import (
     CoreStatus,
     DeviceSession,
     HealthStatus,
+    ListenerClaim,
     UsageRecord,
     UserAccount,
 )
@@ -476,11 +477,25 @@ class XrayDriver(BaseCoreDriver):
 
         header_type = str(raw.get("header_type") or "none").lower()
         if header_type in ("", "none"):
-            # even 'none' may carry request-only facts from a pasted link —
-            # any http fact with header_type none is a contradiction we name
+            # Plain RAW carries no HTTP layer. The wizard blueprint declares
+            # defaults for the camouflage fields (GET / 200 / OK) and older
+            # dashboards submitted them even with header_type=none — a value
+            # equal to its schema default is "never set", not a request. Only
+            # an EXPLICIT non-default http fact is a contradiction we name.
+            from app.studio.wizard import XRAY_TCP_HTTP_DEFAULTS
+
+            def _explicit(key: str) -> bool:
+                value = raw.get(key)
+                if value in (None, "", [], {}):
+                    return False
+                default = XRAY_TCP_HTTP_DEFAULTS.get(key)
+                if default in (None, ""):
+                    return True
+                return str(value).strip().lower() != str(default).strip().lower()
+
             leftover = [k for k in ("http_method", "request_headers",
                                     "response_status", "response_reason",
-                                    "response_headers") if raw.get(k)]
+                                    "response_headers") if _explicit(k)]
             if leftover:
                 raise CoreError(
                     f"TCP inbound '{tag}': {leftover} require header_type=http "
@@ -520,6 +535,11 @@ class XrayDriver(BaseCoreDriver):
         reason = str(raw.get("response_reason") or "OK")
         if "\r" in reason or "\n" in reason:
             raise CoreError(f"TCP inbound '{tag}': response_reason cannot span lines.")
+        # Xray's HttpHeaderObject keeps every header value as a *list* (one
+        # is picked per connection) and the legacy catalogue parser refuses a
+        # bare string for Host ("path and host must be list, not str") — so a
+        # camouflaged inbound built from the wizard was rejected at apply
+        # time. Emit the documented list shape on both sides.
         return {
             "header": {
                 "type": "http",
@@ -527,13 +547,13 @@ class XrayDriver(BaseCoreDriver):
                     "method": method,
                     "path": paths,
                     "version": "1.1",
-                    "headers": req_headers,
+                    "headers": {name: [value] for name, value in req_headers.items()},
                 },
                 "response": {
                     "version": "1.1",
                     "status": status,
                     "reason": reason,
-                    "headers": resp_headers,
+                    "headers": {name: [value] for name, value in resp_headers.items()},
                 },
             }
         }
@@ -717,6 +737,14 @@ class XrayDriver(BaseCoreDriver):
         """Keep only the keys the xray account model understands."""
         keys = _PROTOCOL_SETTINGS_KEYS[account.protocol]
         cleaned = {k: v for k, v in account.settings.items() if k in keys}
+        if account.protocol == "shadowsocks" and cleaned.get("method"):
+            # Legacy restores stored 'chacha20-poly1305'; the account model
+            # only accepts the canonical spelling — map it here so any path
+            # replaying stored settings converges instead of erroring.
+            from app.models.proxy import canonical_ss_method
+
+            cleaned["method"] = (canonical_ss_method(cleaned["method"])
+                                 or "chacha20-ietf-poly1305")
         if account.protocol in ("vless", "trojan"):
             cleaned.setdefault("flow", FLOW_NONE)
         return cleaned
@@ -750,9 +778,25 @@ class XrayDriver(BaseCoreDriver):
             if info.get("protocol") == account.protocol and tag not in excluded
         }
 
-    # ------------------------------------------------------------------ #
-    # lifecycle
-    # ------------------------------------------------------------------ #
+    async def listener_claims(self) -> list[ListenerClaim]:
+        claims: list[ListenerClaim] = []
+        for tag, inbound in (await self._inbounds()).items():
+            port = int(inbound.get("port") or 0)
+            if not port:
+                continue
+            network = str(inbound.get("network") or "tcp").lower()
+            transports = ("tcp", "udp") if inbound.get("protocol") in {"shadowsocks", "socks"} else (
+                ("udp",) if network in {"quic", "kcp", "mkcp"} else ("tcp",))
+            for transport in transports:
+                claims.append(ListenerClaim(
+                    core_id=self.metadata.id,
+                    protocol=str(inbound.get("protocol") or "xray"),
+                    transport=transport,
+                    address=str(inbound.get("listen") or "0.0.0.0"),
+                    port=port, label=str(tag),
+                ))
+        return claims
+
     # ------------------------------------------------------------------ #
     # lifecycle: install / update / uninstall (real SELF_INSTALL)
     # ------------------------------------------------------------------ #
@@ -903,14 +947,60 @@ class XrayDriver(BaseCoreDriver):
     async def get_online_devices(
         self, account_ids: list[str] | None = None
     ) -> list[DeviceSession]:
-        online = await asyncio.to_thread(self._backend.online_accounts)
         now = datetime.now(timezone.utc)
+        detail_getter = getattr(self._backend, "online_device_details", None)
+        if callable(detail_getter):
+            detailed = await asyncio.to_thread(detail_getter)
+            if detailed:
+                def seen_at(value: int) -> datetime:
+                    stamp = float(value or 0)
+                    # Accept milliseconds defensively; current Xray uses seconds.
+                    if stamp > 10_000_000_000:
+                        stamp /= 1000
+                    try:
+                        return datetime.fromtimestamp(stamp, tz=timezone.utc)
+                    except (OverflowError, OSError, ValueError):
+                        return now
+                return [
+                    DeviceSession(
+                        core_id=self.metadata.id,
+                        account_id=email,
+                        ip=ip,
+                        last_activity=seen_at(last_seen),
+                        metadata={"identity": "source_ip", "provider": "xray-online"},
+                    )
+                    for email, ips in detailed.items()
+                    if account_ids is None or email in account_ids
+                    for ip, last_seen in sorted(ips.items())
+                ]
+        native_getter = getattr(self._backend, "online_devices", None)
+        if callable(native_getter):
+            by_email = await asyncio.to_thread(native_getter)
+            if by_email:
+                return [
+                    DeviceSession(
+                        core_id=self.metadata.id,
+                        account_id=email,
+                        ip=ip,
+                        last_activity=now,
+                        metadata={"identity": "source_ip", "provider": "xray-online"},
+                    )
+                    for email, ips in by_email.items()
+                    if account_ids is None or email in account_ids
+                    for ip in sorted(ips)
+                ]
+
+        # Old Xray releases and loopback-only reverse-proxy topologies cannot
+        # expose source IPs. Preserve honest presence as one lower-bound device
+        # per online account; never label that fallback a HWID.
+        online = await asyncio.to_thread(self._backend.online_accounts)
         return [
             DeviceSession(
                 core_id=self.metadata.id,
                 account_id=email,
-                ip=None,  # xray stats API has no per-user IP table
+                ip=None,
                 last_activity=now,
+                metadata={"identity": "account_presence", "provider": "traffic-delta"},
             )
             for email in online
             if account_ids is None or email in account_ids
@@ -1069,7 +1159,24 @@ class XrayDriver(BaseCoreDriver):
 
         network = inbound.get("network", "tcp")
         transport: dict[str, Any] = {"type": network}
-        if network == "ws":
+        if network in ("tcp", "raw") and inbound.get("header_type") == "http":
+            # RAW/TCP HTTP-header camouflage (tcpSettings.header.type=http):
+            # the client has to send the same fake request, so path/Host ride
+            # on the fragment and become headerType=http&path=&host= on the
+            # share link (a plain type=tcp link dialled the camouflaged
+            # listener with raw VLESS and was refused).
+            hostnames = host.get("host") or inbound.get("host") or []
+            req_host = (self._render_host_value(random.choice(hostnames), variables, wild=True)
+                        if hostnames else None)
+            if host.get("use_sni_as_host") and sni:
+                req_host = sni
+            if host.get("path") is not None:
+                path = (host["path"] or "").format_map(variables)
+            else:
+                path = (inbound.get("path") or "/").format_map(variables)
+            transport.update({"type": "tcp", "header_type": "http", "path": path or "/",
+                              **({"host": [req_host]} if req_host else {})})
+        elif network == "ws":
             hostnames = host.get("host") or inbound.get("host") or []
             req_host = (self._render_host_value(random.choice(hostnames), variables, wild=True)
                         if hostnames else None)
@@ -1154,8 +1261,10 @@ class XrayDriver(BaseCoreDriver):
         if not targets:
             section.artifacts.append(DeliveryArtifact(
                 kind=ArtifactKind.NOTE, label="Unavailable",
-                note=f"No inbound is available for protocol '{protocol}' "
-                     "on this core right now.",
+                note=(f"No inbound is available for protocol '{protocol}' on this "
+                      f"core right now — create a '{protocol}' inbound in "
+                      "Inbounds → Add inbound and this account serves it "
+                      "automatically."),
             ))
             return DeliveryProfile(core_id=self.metadata.id, sections=[section])
 

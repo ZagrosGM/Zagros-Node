@@ -47,6 +47,7 @@ from app.cores.types import (
     CoreStatus,
     DeviceSession,
     HealthStatus,
+    ListenerClaim,
     UsageRecord,
     UserAccount,
 )
@@ -61,8 +62,28 @@ _INBOUND_KEYS: dict[str, set[str]] = {
     # management, usage accounting and delivery live here now.
     "hysteria2": {"password"},
     "tuic": {"uuid", "password"},
+    # per-user listeners the wizard could already CREATE but nobody could be
+    # assigned to ("Protocol 'anytls' is not supported by the sing-box
+    # core"): anytls users are {name, password}; naive/socks/http/mixed users
+    # are {username, password} — all are real per-user identities in the
+    # sing-box inbound structs, so accounting/delivery work like the rest.
+    "anytls": {"password"},
+    "naive": {"username", "password"},
+    "socks": {"username", "password"},
+    "http": {"username", "password"},
+    "mixed": {"username", "password"},
 }
 _PROTOCOLS = set(_INBOUND_KEYS)
+#: protocols whose users authenticate with username+password (sing-box
+#: ``users: [{username, password}]``) — the account_id is the username
+_USERPASS_PROTOCOLS = frozenset({"naive", "socks", "http", "mixed"})
+#: values older 1.0.3 dashboards submitted for HIDDEN camouflage fields under
+#: header_type=none — "never set", not a contradiction (GET was the schema
+#: default before the verb became opt-in).
+_LEGACY_TCP_HTTP_DEFAULTS = {"http_method": "GET"}
+#: the derived (no studio document) render only knows how to bind THESE —
+#: the newer per-user protocols exist only as wizard-created listeners
+_DERIVED_PROTOCOLS = frozenset({"vless", "vmess", "trojan", "shadowsocks", "hysteria2", "tuic"})
 
 
 def _x25519_keypair() -> tuple[str, str]:
@@ -91,7 +112,8 @@ class SingBoxDriver(BaseCoreDriver):
             "natively serves vless/vmess/trojan/shadowsocks plus the "
             "consolidated Hysteria2 and TUIC v5 protocols (: the "
             "standalone hy2/tuic cores folded in — one verified matrix, "
-            "unified per-user accounting), and still the richest native "
+            "unified per-user accounting), per-user AnyTLS / NaïveProxy / "
+            "SOCKS5 / HTTP / mixed listeners, and still the richest native "
             "outbound set (wireguard, hysteria2, tuic, shadowsocks, socks, "
             "http) — the panel's prime chain target."
         ),
@@ -126,6 +148,8 @@ class SingBoxDriver(BaseCoreDriver):
                 "final_outbound": {"type": "string", "default": "direct"},
                 "stats_enabled": {"type": "boolean", "default": True},
                 "stats_api": {"type": "string", "default": "127.0.0.1:19091"},
+                "clash_api": {"type": "string", "default": "127.0.0.1:19092",
+                              "description": "loopback session API used for source-IP enforcement"},
                 "geoip_db": {"type": "string"},
                 "geosite_db": {"type": "string"},
             },
@@ -144,6 +168,8 @@ class SingBoxDriver(BaseCoreDriver):
             "geosite_db": "",
             "stats_enabled": True,
             "stats_api": "127.0.0.1:19091",
+            "clash_api": "127.0.0.1:19092",
+            "log_buffer": 5000,
         },
         homepage="https://github.com/SagerNet/sing-box",
         release_repo="SagerNet/sing-box",
@@ -169,6 +195,12 @@ class SingBoxDriver(BaseCoreDriver):
         self._chain_listeners: dict[tuple[str, int], ChainEndpoint] = {}
         self._usage = DeltaTracker()
         self._online_seen: dict[str, tuple[int, int]] = {}
+        # Info logs correlate source and authenticated user by sing-box's
+        # connection context ID; Clash API then tells us which sources remain
+        # active and gives closeable connection IDs.
+        self._log_sources: dict[str, str] = {}
+        self._bound_log_events: set[str] = set()
+        self._source_bindings: dict[tuple[str, str], tuple[Any, Any]] = {}
         self._v2ray_supported: bool | None = None  # lazy binary probe cache
         self._stats_degrade_warned = False
         self._studio_doc: dict[str, Any] | None = None  # set by apply_studio_document
@@ -188,9 +220,17 @@ class SingBoxDriver(BaseCoreDriver):
     def _user_entry(account: UserAccount) -> dict[str, Any]:
         protocol = account.protocol
         entry: dict[str, Any] = {"name": account.account_id}
-        if protocol == "hysteria2":
-            # sing-box hysteria2 users are {name, password}
+        if protocol in ("hysteria2", "anytls"):
+            # sing-box hysteria2/anytls users are {name, password}
             entry["password"] = str(account.settings["password"])
+        elif protocol in _USERPASS_PROTOCOLS:
+            # naive/socks/http/mixed users are {username, password}; the
+            # username IS the account identity (the stats service keys its
+            # user>>> counters by it, exactly like `name` elsewhere)
+            entry = {
+                "username": str(account.settings.get("username") or account.account_id),
+                "password": str(account.settings["password"]),
+            }
         elif protocol in ("vless", "vmess"):
             entry["uuid"] = str(account.settings["id"])
             if protocol == "vless" and account.settings.get("flow"):
@@ -214,7 +254,7 @@ class SingBoxDriver(BaseCoreDriver):
             return self._merge_studio_inbounds()
         ports: dict[str, int] = self.settings["ports"]
         inbounds: list[dict[str, Any]] = []
-        for protocol in sorted(_PROTOCOLS):
+        for protocol in sorted(_DERIVED_PROTOCOLS):
             users = [
                 self._user_entry(a)
                 for a in self._accounts.values()
@@ -320,7 +360,14 @@ class SingBoxDriver(BaseCoreDriver):
                     self._user_entry(a)
                     for a in self._accounts.values()
                     if a.protocol == ptype and a.enabled
+                    and self._account_selects(a, tag)
                 ]
+                # the wizard-level credential (anytls listener password,
+                # optional socks/http/naive user) stays as a bootstrap
+                # identity ONLY while no panel user is on the listener —
+                # once real accounts exist they are the user list, so a
+                # revoked user cannot keep connecting through it
+                bootstrap = list(ib.get("users") or [])
                 if users:
                     ib["users"] = users
                     merged.append(ib)
@@ -331,6 +378,20 @@ class SingBoxDriver(BaseCoreDriver):
                     # authenticates nobody until the first grant arrives.
                     ib["users"] = []
                     merged.append(ib)
+                elif ptype == "anytls":
+                    # anytls REQUIRES a non-empty users list — the wizard's
+                    # listener password keeps the listener bound
+                    ib["users"] = bootstrap
+                    merged.append(ib)
+                elif ptype in _USERPASS_PROTOCOLS:
+                    # socks/http/mixed accept no users (= open proxy) — keep
+                    # the operator's wizard user if any; naive needs users
+                    if bootstrap or ptype != "naive":
+                        if bootstrap:
+                            ib["users"] = bootstrap
+                        else:
+                            ib.pop("users", None)
+                        merged.append(ib)
                 # Other account protocols retain the conservative no-user
                 # drop because older sing-box versions reject some empty
                 # listener shapes.
@@ -344,6 +405,17 @@ class SingBoxDriver(BaseCoreDriver):
                 "listen_port": port,
             })
         return merged
+
+    @staticmethod
+    def _account_selects(account: UserAccount, tag: str) -> bool:
+        """Grant selection honored at RENDER time too: an account granted
+        inbound A must not be written into inbound B of the same protocol
+        (delivery already filtered this way; the listener did not)."""
+        selected = account.settings.get("inbound_tags")
+        if selected and tag not in {str(t) for t in selected}:
+            return False
+        excluded = account.settings.get("excluded_inbounds") or []
+        return tag not in {str(t) for t in excluded}
 
     #: protocols the wizard can materialize — verified live against
     #: sing-box 1.12.4 (`sing-box check` per offered combo)
@@ -441,6 +513,101 @@ class SingBoxDriver(BaseCoreDriver):
                 })
         return account
 
+    @staticmethod
+    def _studio_tcp_camouflage(tag: str, raw: dict[str, Any], *, proto: str,
+                               net: str, security: str) -> dict[str, Any] | None:
+        """TCP (raw) HTTP camouflage — the same wizard xray offers for its
+        RAW header (v1.0.3). sing-box has no ``tcpSettings.header``; its
+        equivalent is the V2Ray ``http`` transport (plain HTTP/1.1 without
+        TLS, HTTP/2 under TLS), which VERIFIES host/path/method and writes
+        the extra headers into the response. Returns the transport struct
+        for ``header_type=http``, ``None`` for plain TCP; contradictions
+        (http facts without the header, unknown header kinds, REALITY) are
+        refused loudly instead of being dropped."""
+        from app.studio.headers import parse_http_headers
+        from app.studio.wizard import SINGBOX_TCP_HTTP_DEFAULTS
+
+        header_type = str(raw.get("header_type") or "none").lower()
+        if net not in ("", "tcp"):
+            if header_type not in ("", "none"):
+                raise CoreError(
+                    f"inbound '{tag}': header_type applies to the TCP (raw) "
+                    f"transport only — the {net} transport already IS an "
+                    "HTTP-shaped carrier.")
+            return None
+        if header_type in ("", "none"):
+            # a value equal to its schema default is "never set" (older
+            # dashboards submitted GET even under header_type=none); only an
+            # EXPLICIT http fact contradicts a plain TCP listener
+            def _explicit(key: str) -> bool:
+                value = raw.get(key)
+                if value in (None, "", [], {}):
+                    return False
+                default = (SINGBOX_TCP_HTTP_DEFAULTS.get(key)
+                           or _LEGACY_TCP_HTTP_DEFAULTS.get(key))
+                if default in (None, ""):
+                    return True
+                return str(value).strip().lower() != str(default).strip().lower()
+
+            leftover = [k for k in ("http_method", "request_headers") if _explicit(k)]
+            if leftover:
+                raise CoreError(
+                    f"TCP inbound '{tag}': {leftover} require header_type=http "
+                    "(plain TCP carries no HTTP layer).")
+            return None
+        if header_type != "http":
+            raise CoreError(
+                f"TCP inbound '{tag}': header_type '{header_type}' is not a "
+                "sing-box TCP header — supported: none, http.")
+        if proto not in ("vless", "vmess", "trojan"):
+            raise CoreError(
+                f"TCP inbound '{tag}': HTTP camouflage exists for VLESS/VMess/"
+                f"Trojan listeners only, not {proto}.")
+        if security == "reality":
+            raise CoreError(
+                f"TCP inbound '{tag}': REALITY already camouflages the stream — "
+                "an HTTP layer on top is not a client-supported combination; "
+                "pick header none.")
+        # the verb is VERIFIED by sing-box once set (every other method gets
+        # HTTP 404) and share links have no parameter for it, while sing-box
+        # and xray clients send PUT by default — so it is only ever emitted
+        # on an explicit request (live rc4: the old GET default locked every
+        # subscription client out: "v2ray-http: unexpected status: 404").
+        method = str(raw.get("http_method") or "").strip().upper()
+        if method and not method.isalpha():
+            raise CoreError(f"TCP inbound '{tag}': http method '{method}' is invalid.")
+        path_raw = raw.get("path") or "/"
+        paths = ([p.strip() for p in str(path_raw).split(",") if p.strip()]
+                 if isinstance(path_raw, str) else [str(p) for p in path_raw])
+        if len(paths) != 1:
+            raise CoreError(
+                f"TCP inbound '{tag}': sing-box verifies ONE camouflage path "
+                f"(xray-style comma lists are not accepted), got {path_raw!r}.")
+        path = paths[0]
+        if not path.startswith("/"):
+            raise CoreError(
+                f"TCP inbound '{tag}': the camouflage path must start with '/', "
+                f"got {path!r}.")
+        headers = parse_http_headers(raw.get("request_headers"),
+                                     context=f"TCP/http inbound '{tag}' request")
+        pasted_host = None
+        for name in list(headers):
+            if name.lower() == "host":
+                # Host is sing-box's dedicated `host` verifier, never an
+                # extra header (extra headers are echoed in the RESPONSE)
+                pasted_host = headers.pop(name)
+        host_raw = raw.get("host") or pasted_host
+        hosts = ([h.strip() for h in str(host_raw).split(",") if h.strip()]
+                 if isinstance(host_raw, str) else list(host_raw or []))
+        transport: dict[str, Any] = {"type": "http", "path": path}
+        if method:
+            transport["method"] = method
+        if hosts:
+            transport["host"] = hosts
+        if headers:
+            transport["headers"] = headers
+        return transport
+
     def _studio_entry_to_native(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Studio entry {tag, protocol, listen, port, …wizard fields} → native
         sing-box inbound. Every wizard field maps somewhere; anything
@@ -467,7 +634,10 @@ class SingBoxDriver(BaseCoreDriver):
                  "masquerade",
                  # http transport verb + arbitrary header
                  # maps (ws/http); item 6 — certificate-by-path mode.
-                 "http_method", "certificate_path", "certificate_key_path"}
+                 "http_method", "certificate_path", "certificate_key_path",
+                 # v1.0.3: TCP (raw) HTTP camouflage — the xray RAW/TCP
+                 # wizard on sing-box (rendered as the V2Ray http transport)
+                 "header_type", "request_headers"}
         unknown = sorted(set(raw) - known)
         if unknown:
             raise CoreError(
@@ -507,7 +677,11 @@ class SingBoxDriver(BaseCoreDriver):
         # struct literally lacks it — "unknown field transport", verified); the
         # wizard's transport pick for them is decorative and is dropped here
         skip_transport = proto in ("naive", "anytls")
-        if net == "grpc" and not skip_transport or raw.get("service_name"):
+        camouflage = self._studio_tcp_camouflage(
+            str(raw["tag"]), raw, proto=proto, net=net, security=security)
+        if camouflage is not None:
+            ib["transport"] = camouflage
+        elif net == "grpc" and not skip_transport or raw.get("service_name"):
             if not raw.get("service_name"):
                 raise CoreError("gRPC inbound requires service_name")
             ib["transport"] = {"type": "grpc", "service_name": raw["service_name"]}
@@ -578,8 +752,9 @@ class SingBoxDriver(BaseCoreDriver):
                 f"TLS1.3); '{security}' is not servable — use the TLS security "
                 "(the only one the wizard offers for these protocols)."
             )
-        if proto == "naive" and not raw.get("username"):
-            raise CoreError("naive (HTTPS/2 proxy) needs username+password users.")
+        # naive used to demand a wizard-level username/password pair; users
+        # are panel accounts now (assigned through core access) — the
+        # optional wizard pair is only a bootstrap identity.
         if security == "reality" or raw.get("public_key"):
             if proto in ("vmess", "shadowsocks"):
                 raise CoreError(
@@ -648,8 +823,9 @@ class SingBoxDriver(BaseCoreDriver):
             password = str(raw.get("password") or "")
             if not password:
                 raise CoreError(
-                    "anytls needs a listener password (its users authenticate "
-                    "by password; per-user accounts stay a panel concern)."
+                    "anytls needs a listener password (sing-box refuses an "
+                    "anytls inbound without at least one user; panel users "
+                    "assigned to this inbound are added next to it)."
                 )
             ib["users"] = [{"name": str(raw.get("username") or raw["tag"]),
                             "password": password}]
@@ -745,6 +921,28 @@ class SingBoxDriver(BaseCoreDriver):
             os.chmod(path, mode)
         return cert_path, key_path
 
+    async def listener_claims(self) -> list[ListenerClaim]:
+        claims: list[ListenerClaim] = []
+        for inbound in self._render_inbounds():
+            port = int(inbound.get("listen_port") or 0)
+            if not port:
+                continue
+            protocol = str(inbound.get("type") or "sing-box")
+            if protocol in {"hysteria2", "tuic"}:
+                transports = ("udp",)
+            elif protocol in {"shadowsocks", "socks", "mixed"}:
+                transports = ("tcp", "udp")
+            else:
+                transports = ("tcp",)
+            for transport in transports:
+                claims.append(ListenerClaim(
+                    core_id=self.metadata.id, protocol=protocol,
+                    transport=transport,
+                    address=str(inbound.get("listen") or "0.0.0.0"),
+                    port=port, label=str(inbound.get("tag") or protocol),
+                ))
+        return claims
+
     def render_config(self) -> dict[str, Any]:
         """Desired-state → full sing-box JSON (deterministic, testable)."""
         from app.platform.bandwidth import mark_for_user
@@ -774,7 +972,10 @@ class SingBoxDriver(BaseCoreDriver):
         final = self.settings.get("final_outbound") or "direct"
         inbounds = self._render_inbounds()
         config: dict[str, Any] = {
-            "log": {"level": "warning", "timestamp": True},
+            # Info lines carry a shared connection context containing source
+            # and authenticated account. They are parsed locally for strict
+            # cross-core IP limits and never used as HWID.
+            "log": {"level": "info", "timestamp": True},
             "dns": {"servers": [{"type": "local", "tag": "dns-local"}]},
             "inbounds": inbounds,
             "outbounds": outbounds,
@@ -787,20 +988,25 @@ class SingBoxDriver(BaseCoreDriver):
                 "auto_detect_interface": True,
             },
         }
+        config["experimental"] = {
+            "clash_api": {
+                # Loopback only; this API supplies source IP/connection IDs so
+                # Zagros can terminate a banned source immediately.
+                "external_controller": self.settings.get("clash_api", "127.0.0.1:19092"),
+            }
+        }
         if self.settings.get("stats_enabled") and self._v2ray_api_supported():
-            config["experimental"] = {
-                "v2ray_api": {
-                    "listen": self.settings["stats_api"],
-                    "stats": {
-                        "enabled": True,
-                        "inbounds": [
-                            f"{ib['tag']}"
-                            for ib in inbounds
-                            if not ib["tag"].startswith("zg-chain-")
-                        ],
-                        "outbounds": ["direct"],
-                        "users": sorted(self._accounts),
-                    },
+            config["experimental"]["v2ray_api"] = {
+                "listen": self.settings["stats_api"],
+                "stats": {
+                    "enabled": True,
+                    "inbounds": [
+                        f"{ib['tag']}"
+                        for ib in inbounds
+                        if not ib["tag"].startswith("zg-chain-")
+                    ],
+                    "outbounds": ["direct"],
+                    "users": sorted(self._accounts),
                 },
             }
         elif self.settings.get("stats_enabled"):
@@ -942,8 +1148,17 @@ class SingBoxDriver(BaseCoreDriver):
                 s["uuid"] = str(_uuid.uuid4())
             if not s.get("password"):
                 s["password"] = _secrets.token_hex(16)
-        elif proto in ("trojan", "shadowsocks", "hysteria2") and not s.get("password"):
+        elif proto in ("trojan", "shadowsocks", "hysteria2", "anytls") and not s.get("password"):
             s["password"] = _secrets.token_urlsafe(18)
+        elif proto in _USERPASS_PROTOCOLS:
+            if not s.get("username"):
+                # the panel username is unique per user and one user owns ONE
+                # account per (core, protocol) — readable for manual client
+                # setup; the account_id is the fallback identity for rows
+                # replayed without their username
+                s["username"] = str(account.username or account.account_id)
+            if not s.get("password"):
+                s["password"] = _secrets.token_urlsafe(18)
 
     async def create_account(self, account: UserAccount) -> None:
         self._ensure_supported(account.protocol)
@@ -1024,7 +1239,30 @@ class SingBoxDriver(BaseCoreDriver):
             )
             raise
         self._stats_error = None
-        return counters
+        return self._counters_by_account(counters)
+
+    def _counters_by_account(self, counters: dict[str, tuple[int, int]]) -> dict[str, tuple[int, int]]:
+        """The stats service keys ``user>>>…`` by the rendered user identity —
+        ``name`` (= account_id) for most protocols, but ``username`` for
+        naive/socks/http/mixed users. Fold those back onto account ids so
+        accounting and online detection see one identity space."""
+        alias: dict[str, str] = {}
+        for account in self._accounts.values():
+            if account.protocol in _USERPASS_PROTOCOLS:
+                username = str(account.settings.get("username") or account.account_id)
+                if username != account.account_id:
+                    alias[username] = account.account_id
+        if not alias:
+            return counters
+        out: dict[str, tuple[int, int]] = {}
+        for key, value in counters.items():
+            target = alias.get(key, key)
+            if target in out:
+                up, down = out[target]
+                out[target] = (up + value[0], down + value[1])
+            else:
+                out[target] = value
+        return out
 
     async def get_usage(
         self, account_ids: list[str] | None = None, since: Any | None = None
@@ -1043,20 +1281,133 @@ class SingBoxDriver(BaseCoreDriver):
             ))
         return records
 
+    @staticmethod
+    def _source_ip(value: str) -> str | None:
+        """Extract a canonical IP from sing-box Socksaddr log spelling."""
+        import ipaddress
+
+        raw = value.strip().rstrip(",")
+        if raw.startswith("[") and "]:" in raw:
+            raw = raw[1:raw.rfind("]")]
+        else:
+            try:
+                ipaddress.ip_address(raw)
+            except ValueError:
+                if raw.count(":") == 1:
+                    raw = raw.rsplit(":", 1)[0]
+        try:
+            return str(ipaddress.ip_address(raw))
+        except ValueError:
+            return None
+
+    def _read_source_bindings(self):
+        """Parse source/account pairs sharing sing-box connection context IDs."""
+        import re
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        logs = list(self._backend.logs(int(self.settings.get("log_buffer", 5000))))
+        identities = {
+            str(account.settings.get("username") or account.account_id): account.account_id
+            for account in self._accounts.values()
+        }
+        identities.update({account_id: account_id for account_id in self._accounts})
+        ansi = re.compile(r"\x1b\[[0-9;]*m")
+        context_re = re.compile(r"\[(\d+)\s+[^\]]+\]")
+        source_re = re.compile(r"inbound connection from\s+(\S+)")
+        user_re = re.compile(r"\[([^\]]+)\]\s+inbound connection to\s+")
+        combined_re = re.compile(r"\[([^\]]+)\]\s+inbound connection from\s+(\S+)")
+        for index, original in enumerate(logs):
+            # ManagedProcess keeps lines in emission order. Preserve that order
+            # even when several new connections are discovered in one poll.
+            event_time = now - timedelta(microseconds=len(logs) - index)
+            line = ansi.sub("", str(original))
+            context_match = context_re.search(line)
+            context = context_match.group(1) if context_match else None
+            combined = combined_re.search(line)
+            if combined:
+                account_id = identities.get(combined.group(1))
+                ip = self._source_ip(combined.group(2))
+                event = context or hashlib.sha256(line.encode()).hexdigest()
+                if account_id and ip and event not in self._bound_log_events:
+                    key = (account_id, ip)
+                    first, _last = self._source_bindings.get(key, (event_time, event_time))
+                    self._source_bindings[key] = (first, event_time)
+                    self._bound_log_events.add(event)
+                continue
+            source = source_re.search(line)
+            if source and context:
+                ip = self._source_ip(source.group(1))
+                if ip:
+                    self._log_sources[context] = ip
+            user = user_re.search(line)
+            if (user and context and context in self._log_sources
+                    and context not in self._bound_log_events):
+                account_id = identities.get(user.group(1))
+                ip = self._log_sources[context]
+                if account_id:
+                    key = (account_id, ip)
+                    first, _last = self._source_bindings.get(key, (event_time, event_time))
+                    self._source_bindings[key] = (first, event_time)
+                    self._bound_log_events.add(context)
+        # Bound memory while retaining enough correlation to survive quiet
+        # long-lived tunnels and one missed five-second poll.
+        cutoff = now.timestamp() - 3600
+        self._source_bindings = {
+            key: times for key, times in self._source_bindings.items()
+            if times[1].timestamp() >= cutoff
+        }
+        return now
+
     async def get_online_devices(
         self, account_ids: list[str] | None = None
     ) -> list[DeviceSession]:
-        """Counter-delta heuristic (documented, same technique 3x-ui uses):
+        """Exact source/account sessions via info-log + Clash API correlation.
 
-        the stats API exposes traffic counters but no session list — a user
-        whose counters grew since the last poll is *active* right now. The
-        user's IP is not exposed by the API and is honestly reported as None.
+        Current sing-box deliberately omits ``metadata.User`` from Clash JSON,
+        while its info logs carry the user under the same connection context
+        as the source. Combining those two native views keeps source identity
+        honest and also supplies connection IDs for immediate termination.
         """
-        from datetime import datetime, timezone
-
-        counters = await self._query_counters()
-        now = datetime.now(timezone.utc)
+        now = await asyncio.to_thread(self._read_source_bindings)
+        connections_getter = getattr(self._backend, "clash_connections", None)
+        connections = (await asyncio.to_thread(connections_getter)
+                       if callable(connections_getter) else [])
+        active_ips = {
+            self._source_ip(str((row.get("metadata") or {}).get("sourceIP") or ""))
+            for row in connections
+        }
+        active_ips.discard(None)
         sessions: list[DeviceSession] = []
+        for (account_id, ip), (first_seen, log_seen) in self._source_bindings.items():
+            if account_ids is not None and account_id not in account_ids:
+                continue
+            # Empty can mean the API is briefly unavailable during restart;
+            # retain very recent authenticated logs as a fail-safe. With a
+            # working non-empty API, only genuinely active sources survive.
+            if active_ips:
+                if ip not in active_ips:
+                    continue
+            elif (now - log_seen).total_seconds() > 90:
+                continue
+            # Keep authenticated correlation alive for genuinely active
+            # long-lived tunnels. Without this, a one-hour Hysteria2 session
+            # would age out even though Clash still reports its source. A
+            # log-only fallback is NOT refreshed or it would never expire.
+            if active_ips:
+                self._source_bindings[(account_id, ip)] = (first_seen, now)
+            sessions.append(DeviceSession(
+                core_id=self.metadata.id, account_id=account_id, ip=ip,
+                connected_at=first_seen, last_activity=now,
+                metadata={"identity": "source_ip",
+                          "provider": "sing-box-log+clash"},
+            ))
+        if sessions:
+            return sessions
+
+        # Honest lower-bound fallback for binaries/configs without Clash API:
+        # counters can prove presence but cannot invent a source address.
+        counters = await self._query_counters()
         for account_id, (up, down) in counters.items():
             if account_id not in self._accounts:
                 continue
@@ -1065,14 +1416,19 @@ class SingBoxDriver(BaseCoreDriver):
             previous = self._online_seen.get(account_id)
             if previous is not None and (up, down) != previous:
                 sessions.append(DeviceSession(
-                    core_id=self.metadata.id,
-                    account_id=account_id,
-                    ip=None,  # the API exposes no client IPs (documented)
+                    core_id=self.metadata.id, account_id=account_id, ip=None,
                     last_activity=now,
                     metadata={"detection": "counter-delta heuristic"},
                 ))
             self._online_seen[account_id] = (up, down)
         return sessions
+
+    async def terminate_source_ip(self, source_ip: str) -> int:
+        """Close every active sing-box connection from a newly banned IP."""
+        closer = getattr(self._backend, "close_connections_from", None)
+        if not callable(closer):
+            return 0
+        return int(await asyncio.to_thread(closer, source_ip) or 0)
 
     # ------------------------------------------------------------------ #
     # routing translation (ROUTING + GEO_ROUTING + PROCESS_ROUTING)
@@ -1414,7 +1770,10 @@ class SingBoxDriver(BaseCoreDriver):
         elif proto == "tuic":
             outbound["uuid"] = str(account.settings.get("uuid") or account.settings.get("id"))
             outbound["password"] = str(account.settings["password"])
-        else:  # trojan / shadowsocks / hysteria2
+        elif proto in _USERPASS_PROTOCOLS:
+            outbound["username"] = str(account.settings.get("username") or account.account_id)
+            outbound["password"] = str(account.settings["password"])
+        else:  # trojan / shadowsocks / hysteria2 / anytls
             outbound["password"] = str(account.settings["password"])
             if proto == "shadowsocks":
                 method = str(ib.get("method") or self.settings["ss_method"])
@@ -1458,10 +1817,14 @@ class SingBoxDriver(BaseCoreDriver):
                 "service_name": transport.get("service_name") or "",
             }
         elif net == "http":
+            # the listener VERIFIES host/path/method when set — the client
+            # side has to send exactly those (headers ride along as well)
             outbound["transport"] = {
                 "type": "http",
                 **({"path": transport["path"]} if transport.get("path") else {}),
                 **({"host": transport["host"]} if transport.get("host") else {}),
+                **({"method": transport["method"]} if transport.get("method") else {}),
+                **({"headers": transport["headers"]} if transport.get("headers") else {}),
             }
         # protocol extras
         if proto == "hysteria2":
@@ -1477,8 +1840,9 @@ class SingBoxDriver(BaseCoreDriver):
 
     @staticmethod
     def _protocol_display(protocol: str) -> str:
-        return {"hysteria2": "Hysteria 2", "tuic": "TUIC v5"}.get(
-            protocol, protocol.upper())
+        return {"hysteria2": "Hysteria 2", "tuic": "TUIC v5", "anytls": "AnyTLS",
+                "naive": "NaïveProxy", "socks": "SOCKS5", "http": "HTTP proxy",
+                "mixed": "Mixed (SOCKS5+HTTP)"}.get(protocol, protocol.upper())
 
     async def describe_delivery(
         self, account: UserAccount, context: Any | None = None
@@ -1510,8 +1874,9 @@ class SingBoxDriver(BaseCoreDriver):
                     kind=ArtifactKind.NOTE, label="Unavailable",
                     note=(
                         f"No sing-box inbound for protocol '{account.protocol}' "
-                        "is assigned to this account — ask the administrator to "
-                        "select one in the user's core access."
+                        "is assigned to this account — select one in the user's "
+                        "core access, or create a '{account.protocol}' listener "
+                        "in Inbounds → Add inbound."
                     ),
                 )],
             )
@@ -1524,10 +1889,17 @@ class SingBoxDriver(BaseCoreDriver):
                 key="uuid", label="UUID",
                 value=str(account.settings.get("id") or account.settings.get("uuid")),
                 secret=True))
-        if account.protocol in ("trojan", "shadowsocks", "hysteria2", "tuic"):
+        if account.protocol in _USERPASS_PROTOCOLS:
+            creds_fields.append(DeliveryField(
+                key="username", label="Username",
+                value=str(account.settings.get("username") or account.account_id)))
+        if account.protocol in ("trojan", "shadowsocks", "hysteria2", "tuic",
+                                "anytls", *_USERPASS_PROTOCOLS):
+            # rows replayed without their secret must not crash the page:
+            # the share link below reports the gap as a NOTE instead
             creds_fields.append(DeliveryField(
                 key="password", label="Password",
-                value=str(account.settings["password"]), secret=True))
+                value=str(account.settings.get("password") or ""), secret=True))
         if account.protocol == "shadowsocks":
             method = str(self.settings["ss_method"])
             creds_fields.append(DeliveryField(key="method", label="Cipher", value=method))

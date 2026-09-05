@@ -35,7 +35,7 @@ The panel drives every core on a node through the **same driver runtime the pane
                          │                        zagros-node container                          │
                          │  info_api.py ──► public: node id, versions, TLS certificate, pin      │
                          │  app.py      ──► /v1/register, /v1/heartbeat, /v1/health,             │
-                         │                  /v1/cores/**, /v1/jobs/**   (HMAC-signed)            │
+                         │                  /v1/cores/**, /v1/jobs/**, /v1/ip-bans (signed)      │
                          │  CoreManager ──► vendored drivers: xray sing-box openvpn wireguard    │
                          │                                    ssh softether pptp                 │
                          └───────────────────────────────────────────────────────────────────────┘
@@ -62,6 +62,9 @@ The panel drives every core on a node through the **same driver runtime the pane
 * **Minimal authority.** No shell endpoint, no Docker socket, no arbitrary file access. A lifecycle
   call is limited to an allowlisted core and to settings the driver's own schema declares; any
   path-valued setting must stay under the core root.
+* **Timed source-IP enforcement.** The signed `PUT /v1/ip-bans` projection applies the panel's
+  active bans only to listener ports claimed by managed VPN cores, closes tracked/conntrack flows,
+  and uses nftables element timeouts so addresses unblock even if the panel becomes unreachable.
 * **Explicit TOFU.** The info port is unauthenticated, so it can only be a convenience: the
   installer prints the fingerprint on the node's console and the panel shows it for confirmation
   before pairing — exactly like SSH host-key verification. `ZAGROS_NODE_INFO_BIND` lets you lock the
